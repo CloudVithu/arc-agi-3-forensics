@@ -1,0 +1,10 @@
+logs/
+!logs/.gitkeep
+environment_files/
+recordings/
+.venv/
+vendor/
+.kaggle/
+__pycache__/
+*.pyc
+notebooks/submission.ipynb
