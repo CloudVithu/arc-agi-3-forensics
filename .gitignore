@@ -8,3 +8,4 @@ vendor/
 __pycache__/
 *.pyc
 notebooks/submission.ipynb
+.pytest_cache/

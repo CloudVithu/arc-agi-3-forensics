@@ -1,87 +1,142 @@
-"""Your ARC-AGI-3 agent. This is the *only* file you should normally edit.
+"""My ARC-AGI-3 agent.
 
-`scripts/build_notebook.py` splices the contents of this file into the
-Kaggle submission notebook, so your local dev loop and your Kaggle
-submission stay in lock-step:
-
-    [edit my_agent.py] → [make play-local] → [make submit]
-
-The default body below is a port of the Stochastic Goose / random_agent
-sample — a known-good baseline that produces a valid submission and
-proves your end-to-end pipeline works. Replace `choose_action` with your
-real strategy.
-
-Contract (enforced by the ARC-AGI-3-Agents framework):
-  - Subclass `agents.agent.Agent`.
-  - Class must be named `MyAgent` (the notebook's __init__.py registers it).
-  - Implement `is_done(frames, latest_frame) -> bool`.
-  - Implement `choose_action(frames, latest_frame) -> GameAction`.
+Strategy: try each available action, measure the changed cells in frame[0],
+attribute changes to the preceding action, then exploit the highest-scoring
+action. This is a baseline for experiments, not a general solver.
 """
 from __future__ import annotations
 
+import copy
 import random
-import time
 from typing import Any
 
 from arcengine import FrameData, GameAction, GameState
-
-# When run inside the ARC-AGI-3-Agents framework (locally or on Kaggle)
-# the `agents` package is on sys.path, so this import resolves.
 from agents.agent import Agent
 
 
 class MyAgent(Agent):
-    """Picks legal actions uniformly at random. Replace with your strategy."""
-
-    # Upper bound on actions per game; the framework also enforces global limits.
     MAX_ACTIONS = 80
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-        # Seed per game_id so replays from the same game are reproducible but
-        # different games explore independently.
-        seed = int(time.time() * 1_000_000) + hash(self.game_id) % 1_000_000
-        random.seed(seed)
+
+        self.action_scores: dict[GameAction, int] = {}
+        self.action_attempts: dict[GameAction, int] = {}
+
+        self.previous_grid = None
+        self.previous_action = None
+        self.action_index = 0
 
     @property
     def name(self) -> str:
         return f"{super().name}.{self.MAX_ACTIONS}"
 
-    def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
-        # Stop once we win. Don't stop on GAME_OVER — we want to RESET and retry.
+    def is_done(
+        self,
+        frames: list[FrameData],
+        latest_frame: FrameData,
+    ) -> bool:
         return latest_frame.state is GameState.WIN
 
+    @staticmethod
+    def count_changed_cells(previous_grid: Any, current_grid: Any) -> int:
+        """Count changed cells between two grid snapshots."""
+        changed = 0
+
+        for old_row, new_row in zip(previous_grid, current_grid):
+            for old_cell, new_cell in zip(old_row, new_row):
+                if old_cell != new_cell:
+                    changed += 1
+
+        return changed
+
+    def reset_tracking(self) -> None:
+        self.action_scores.clear()
+        self.action_attempts.clear()
+        self.previous_grid = None
+        self.previous_action = None
+        self.action_index = 0
+
     def choose_action(
-        self, frames: list[FrameData], latest_frame: FrameData
+        self,
+        frames: list[FrameData],
+        latest_frame: FrameData,
     ) -> GameAction:
-        # First call or after a death → reset the level.
-        if latest_frame.state in (GameState.NOT_PLAYED, GameState.GAME_OVER):
+        if latest_frame.state in (
+            GameState.NOT_PLAYED,
+            GameState.GAME_OVER,
+        ):
+            self.reset_tracking()
             return GameAction.RESET
 
-        # ── Per-game strategy fork ───────────────────────────────────────────
-        # By default every game uses the same uniformly-random strategy in the
-        # `else` branch below. This `if` shows ONE example of giving a single
-        # game its own heuristic: on LS20 we bias the random pick so ACTION4
-        # is twice as likely as any other action. Add more `elif` branches to
-        # specialize other games.
-        #
-        # `self.game_id` is set by the framework. It may be the short id
-        # ("ls20") or include a version suffix ("ls20-9607627b"), so we
-        # compare on the prefix to be safe.
-        candidate_actions = [a for a in GameAction if a is not GameAction.RESET]
-        if self.game_id.split("-")[0] == "ls20":
-            weights = [2 if a is GameAction.ACTION4 else 1 for a in candidate_actions]
-            action = random.choices(candidate_actions, weights=weights, k=1)[0]
+        # Use only layer zero for this baseline experiment.
+        current_grid = latest_frame.frame[0]
+
+        # Attribute this observation's changes to the action taken last turn.
+        if self.previous_grid is not None and self.previous_action is not None:
+            changed = self.count_changed_cells(
+                self.previous_grid,
+                current_grid,
+            )
+
+            self.action_scores[self.previous_action] = (
+                self.action_scores.get(self.previous_action, 0) + changed
+            )
+            self.action_attempts[self.previous_action] = (
+                self.action_attempts.get(self.previous_action, 0) + 1
+            )
+
+        # Snapshot the grid so later frame updates cannot alter our baseline.
+        self.previous_grid = copy.deepcopy(current_grid)
+        self.action_index += 1
+
+        candidates = [
+            GameAction.from_id(action_id)
+            for action_id in latest_frame.available_actions
+        ]
+        candidates = [
+            action for action in candidates
+            if action is not GameAction.RESET
+        ]
+
+        if not candidates:
+            self.previous_action = None
+            return GameAction.RESET
+
+        # First explore every available action at least once.
+        untried = [
+            action for action in candidates
+            if action not in self.action_attempts
+        ]
+
+        if untried:
+            action = untried[0]
+            mode = "explore"
+            reason = "Selected an available action not yet attempted."
         else:
-            action = random.choice(candidate_actions)
-        # ────────────────────────────────────────────────────────────────────
+            action = max(
+                candidates,
+                key=lambda candidate: (
+                    self.action_scores.get(candidate, 0)
+                    / max(self.action_attempts.get(candidate, 0), 1)
+                ),
+            )
+            mode = "exploit"
+            reason = (
+                "Selected the action with the highest average "
+                "observed changed-cell count."
+            )
 
         if action.is_complex():
-            # ACTION6 takes (x, y) coordinates on a 64×64 grid.
-            action.set_data(
-                {"x": random.randint(0, 63), "y": random.randint(0, 63)}
-            )
-            action.reasoning = {"why": "random complex action"}
-        else:
-            action.reasoning = f"random simple action: {action.value}"
+            action.set_data({
+                "x": random.randint(0, 63),
+                "y": random.randint(0, 63),
+            })
+
+        action.reasoning = (
+            f"step={self.action_index}; mode={mode}; "
+            f"action={action}; {reason}"
+        )
+
+        self.previous_action = action
         return action
